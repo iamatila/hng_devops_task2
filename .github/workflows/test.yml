@@ -1,0 +1,167 @@
+name: Blue/Green Failover Test
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  BLUE_IMAGE: ${{ secrets.BLUE_IMAGE }}
+  GREEN_IMAGE: ${{ secrets.GREEN_IMAGE }}
+  ACTIVE_POOL: blue
+  RELEASE_ID_BLUE: ${{ github.sha }}-blue
+  RELEASE_ID_GREEN: ${{ github.sha }}-green
+  PORT: 3000
+
+jobs:
+  test-failover:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Create .env file
+        run: |
+          cat > .env << EOF
+          BLUE_IMAGE=${{ env.BLUE_IMAGE }}
+          GREEN_IMAGE=${{ env.GREEN_IMAGE }}
+          ACTIVE_POOL=${{ env.ACTIVE_POOL }}
+          RELEASE_ID_BLUE=${{ env.RELEASE_ID_BLUE }}
+          RELEASE_ID_GREEN=${{ env.RELEASE_ID_GREEN }}
+          PORT=${{ env.PORT }}
+          EOF
+          cat .env
+
+      - name: Make scripts executable
+        run: chmod +x entrypoint.sh test-failover.sh
+
+      - name: Start services
+        run: |
+          docker-compose up -d
+          echo "Waiting for services to be ready..."
+          sleep 10
+
+      - name: Check service health
+        run: |
+          docker-compose ps
+          echo "Testing Blue direct access..."
+          curl -f http://localhost:8081/healthz || exit 1
+          echo "Testing Green direct access..."
+          curl -f http://localhost:8082/healthz || exit 1
+          echo "Testing Nginx proxy..."
+          curl -f http://localhost:8080/healthz || exit 1
+
+      - name: Test baseline (Blue active)
+        run: |
+          echo "=== Testing Baseline ==="
+          for i in {1..10}; do
+            response=$(curl -s -w "\n%{http_code}" http://localhost:8080/version)
+            http_code=$(echo "$response" | tail -n1)
+            
+            if [ "$http_code" != "200" ]; then
+              echo "FAIL: Expected HTTP 200, got $http_code"
+              exit 1
+            fi
+            
+            headers=$(curl -s -I http://localhost:8080/version)
+            app_pool=$(echo "$headers" | grep -i "X-App-Pool" | cut -d' ' -f2 | tr -d '\r')
+            
+            if [ "$app_pool" != "blue" ]; then
+              echo "FAIL: Expected pool 'blue', got '$app_pool'"
+              exit 1
+            fi
+            
+            echo "Request $i: OK (pool=$app_pool)"
+          done
+          echo "✅ Baseline test passed"
+
+      - name: Induce chaos on Blue
+        run: |
+          echo "=== Inducing Chaos ==="
+          curl -X POST http://localhost:8081/chaos/start?mode=error
+          echo "Chaos started, waiting 2s..."
+          sleep 2
+
+      - name: Test automatic failover
+        run: |
+          echo "=== Testing Failover ==="
+          green_count=0
+          non_200_count=0
+          total=30
+          
+          for i in $(seq 1 $total); do
+            response=$(curl -s -w "\n%{http_code}" http://localhost:8080/version)
+            http_code=$(echo "$response" | tail -n1)
+            
+            if [ "$http_code" != "200" ]; then
+              non_200_count=$((non_200_count + 1))
+              echo "Request $i: FAILED (HTTP $http_code)"
+            else
+              headers=$(curl -s -I http://localhost:8080/version)
+              app_pool=$(echo "$headers" | grep -i "X-App-Pool" | cut -d' ' -f2 | tr -d '\r')
+              
+              if [ "$app_pool" = "green" ]; then
+                green_count=$((green_count + 1))
+              fi
+              
+              echo "Request $i: OK (pool=$app_pool)"
+            fi
+            
+            sleep 0.3
+          done
+          
+          green_percentage=$((green_count * 100 / total))
+          
+          echo ""
+          echo "Results:"
+          echo "  Total requests: $total"
+          echo "  Green responses: $green_count ($green_percentage%)"
+          echo "  Non-200 responses: $non_200_count"
+          
+          if [ $non_200_count -gt 0 ]; then
+            echo "❌ FAIL: Detected $non_200_count non-200 responses"
+            exit 1
+          fi
+          
+          if [ $green_percentage -lt 95 ]; then
+            echo "❌ FAIL: Only $green_percentage% from Green (need ≥95%)"
+            exit 1
+          fi
+          
+          echo "✅ Failover test passed: $green_percentage% from Green with 0 errors"
+
+      - name: Stop chaos and verify recovery
+        run: |
+          echo "=== Testing Recovery ==="
+          curl -X POST http://localhost:8081/chaos/stop
+          echo "Chaos stopped, waiting 10s for recovery..."
+          sleep 10
+          
+          for i in {1..5}; do
+            response=$(curl -s -w "\n%{http_code}" http://localhost:8080/version)
+            http_code=$(echo "$response" | tail -n1)
+            headers=$(curl -s -I http://localhost:8080/version)
+            app_pool=$(echo "$headers" | grep -i "X-App-Pool" | cut -d' ' -f2 | tr -d '\r')
+            echo "Request $i: HTTP $http_code (pool=$app_pool)"
+          done
+          
+          echo "✅ Recovery test completed"
+
+      - name: Show logs on failure
+        if: failure()
+        run: |
+          echo "=== Nginx Logs ==="
+          docker-compose logs nginx
+          echo "=== Blue App Logs ==="
+          docker-compose logs app_blue
+          echo "=== Green App Logs ==="
+          docker-compose logs app_green
+
+      - name: Cleanup
+        if: always()
+        run: docker-compose down -v
